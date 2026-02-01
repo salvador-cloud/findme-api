@@ -23,6 +23,11 @@ def root():
     return {"ok": True, "service": "findme-api"}
 
 
+@app.get("/__version")
+def version():
+    return {"version": "v2026-02-01-1"}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -65,4 +70,3 @@ def get_job(album_id: str):
         "progress": res.data["progress"],
         "errorMessage": res.data.get("error_message")
     }
-
