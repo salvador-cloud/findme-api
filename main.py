@@ -18,6 +18,11 @@ class JobCreate(BaseModel):
     uploadKey: str
 
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "findme-api"}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -60,3 +65,4 @@ def get_job(album_id: str):
         "progress": res.data["progress"],
         "errorMessage": res.data.get("error_message")
     }
+
