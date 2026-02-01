@@ -1,23 +1,13 @@
 import os
-import uuid
+import time
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = os.getenv("APP_VERSION", "v2026-02-02-1")
-UPLOAD_BUCKET = os.getenv("UPLOAD_BUCKET", "uploads")
+APP_VERSION = "v2026-02-02-1"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
-# Opcional pero recomendable para Orchids (CORS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # luego lo cerramos a tu dominio
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 def supabase_admin() -> Client:
     url = os.getenv("SUPABASE_URL")
@@ -26,60 +16,75 @@ def supabase_admin() -> Client:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(url, key)
 
+
 class ProcessRequest(BaseModel):
     fingerprint: str
     uploadKey: str | None = None
 
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "findme-api", "version": APP_VERSION}
+    return {"ok": True, "service": "findme-api"}
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": APP_VERSION}
+    return {"ok": True}
+
 
 @app.get("/__version")
 def version():
     return {"version": APP_VERSION}
 
+
 @app.post("/upload")
 async def upload_zip(file: UploadFile = File(...)):
-    # Validación rápida
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are allowed")
-
+    """
+    Upload ZIP to Supabase Storage bucket: uploads
+    Stored path: zips/<uuid>.zip
+    Returns { uploadKey, fingerprint }
+    """
     sb = supabase_admin()
 
-    # Key donde guardamos el zip
-    key = f"zips/{uuid.uuid4()}.zip"
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are supported")
 
-    # Leer bytes del archivo
-    data = await file.read()
-    if not data:
+    content = await file.read()
+    if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Subir a Supabase Storage
-    # supabase-py v2: storage.from_(bucket).upload(path, file, options?)
-    try:
-        sb.storage.from_(UPLOAD_BUCKET).upload(
-            key,
-            data,
-            {"content-type": "application/zip"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    object_path = f"zips/{os.urandom(16).hex()}.zip"
 
-    # Para tu UI: ambos iguales hoy (puedes diferenciar luego)
-    return {"uploadKey": key, "fingerprint": key}
+    # Upload to bucket "uploads"
+    res = sb.storage.from_("uploads").upload(
+        path=object_path,
+        file=content,
+        file_options={"content-type": "application/zip"},
+    )
+
+    # If upload fails, supabase-py returns an error-like object
+    # We'll be defensive:
+    if getattr(res, "error", None):
+        raise HTTPException(status_code=500, detail=f"Upload failed: {res.error}")
+
+    return {
+        "uploadKey": object_path,
+        "fingerprint": object_path
+    }
+
 
 @app.post("/process")
 def process_album(payload: ProcessRequest):
+    """
+    Creates album job record in DB.
+    For demo: auto-completes the job after creation.
+    """
+    sb = supabase_admin()
+
     if not payload.fingerprint:
         raise HTTPException(status_code=400, detail="fingerprint is required")
 
-    sb = supabase_admin()
-
-    # Crear album/job en DB
+    # Create album row
     res = sb.table("albums").insert({
         "fingerprint": payload.fingerprint,
         "status": "pending",
@@ -92,18 +97,22 @@ def process_album(payload: ProcessRequest):
         raise HTTPException(status_code=500, detail="Failed to create album")
 
     album_id = res.data[0]["id"]
-    return {"albumId": album_id, "status": res.data[0]["status"]}
+
+    # ✅ DEMO ONLY: simulate some work, then mark completed
+    time.sleep(1)
+
+    sb.table("albums").update({
+        "status": "completed",
+        "progress": 100
+    }).eq("id", album_id).execute()
+
+    return {"albumId": album_id}
+
 
 @app.get("/jobs/{album_id}")
 def get_job(album_id: str):
     sb = supabase_admin()
-    res = (
-        sb.table("albums")
-        .select("id,status,progress,error_message")
-        .eq("id", album_id)
-        .single()
-        .execute()
-    )
+    res = sb.table("albums").select("id,status,progress,error_message").eq("id", album_id).single().execute()
 
     if not res.data:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -114,4 +123,3 @@ def get_job(album_id: str):
         "progress": res.data["progress"],
         "errorMessage": res.data.get("error_message")
     }
-
