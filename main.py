@@ -1,30 +1,12 @@
 import os
-import uuid
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
+import time
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel
 from supabase import create_client, Client
 
 app = FastAPI()
 
-# ---- CORS (clave para que el browser no bloquee y tire "Failed to fetch") ----
-allowed_origins = [
-    "https://findme.clickcrowdmedia.com",
-    "http://localhost:3000",
-    "http://localhost:3001",
-]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---- Supabase Admin ----
 def supabase_admin() -> Client:
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -32,69 +14,49 @@ def supabase_admin() -> Client:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(url, key)
 
-# ---- Models ----
+
 class ProcessRequest(BaseModel):
     fingerprint: str
-    uploadKey: Optional[str] = None
+    uploadKey: str
 
-# ---- Basic routes ----
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "findme-api"}
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.get("/__version")
 def version():
     return {"version": os.getenv("APP_VERSION", "dev")}
 
-# ---- Upload ZIP (reemplaza /api/upload del front) ----
-@app.post("/upload")
-async def upload_zip(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="file is required")
 
-    filename = (file.filename or "").lower()
-    if not filename.endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are allowed")
-
-    contents = await file.read()
-    if not contents or len(contents) < 10:
-        raise HTTPException(status_code=400, detail="Empty ZIP file")
-
+def simulate_processing(album_id: str):
     sb = supabase_admin()
 
-    # Guardamos el ZIP en Storage bucket "uploads", carpeta zips/
-    key = f"zips/{uuid.uuid4()}.zip"
+    # Mark as processing
+    sb.table("albums").update({"status": "processing", "progress": 5}).eq("id", album_id).execute()
 
-    # Subida al bucket
-    try:
-        res = sb.storage.from_("uploads").upload(
-            key,
-            contents,
-            {"content-type": "application/zip"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    # Simulate progress updates
+    for p in [15, 30, 50, 70, 85, 100]:
+        time.sleep(2)
+        sb.table("albums").update({"progress": p}).eq("id", album_id).execute()
 
-    # supabase-py devuelve dict/obj según versión; si falla normalmente lanza excepción.
-    # Para MVP devolvemos uploadKey y fingerprint (para dedup/cache)
-    return {
-        "uploadKey": key,
-        "fingerprint": key
-    }
+    # Mark completed
+    sb.table("albums").update({"status": "completed", "progress": 100}).eq("id", album_id).execute()
 
-# ---- Process (reemplaza /api/process del front) ----
+
 @app.post("/process")
-def process_album(payload: ProcessRequest):
-    if not payload.fingerprint:
-        raise HTTPException(status_code=400, detail="fingerprint is required")
+def process_album(payload: ProcessRequest, background_tasks: BackgroundTasks):
+    if not payload.uploadKey or not payload.fingerprint:
+        raise HTTPException(status_code=400, detail="uploadKey and fingerprint are required")
 
     sb = supabase_admin()
 
-    # Creamos el album (job)
     res = sb.table("albums").insert({
         "fingerprint": payload.fingerprint,
         "status": "pending",
@@ -107,9 +69,13 @@ def process_album(payload: ProcessRequest):
         raise HTTPException(status_code=500, detail="Failed to create album")
 
     album_id = res.data[0]["id"]
+
+    # Launch background simulation
+    background_tasks.add_task(simulate_processing, album_id)
+
     return {"albumId": album_id}
 
-# ---- Jobs (tu API de estado) ----
+
 @app.get("/jobs/{album_id}")
 def get_job(album_id: str):
     sb = supabase_admin()
