@@ -1,46 +1,45 @@
 import os
-import time
-from fastapi import FastAPI, HTTPException, UploadFile, File
+import io
+import zipfile
+import mimetypes
+from uuid import uuid4
+from typing import Optional, List
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = "v2026-02-02-1"
+APP_VERSION = "v2026-02-02-2"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
-# --------------------------------------------------------------------
-# CORS (FIX)
-# Orchids/Electron en preview está usando origin http://localhost:3000
-# --------------------------------------------------------------------
-cors_allow_all = (os.getenv("CORS_ALLOW_ALL", "").lower() == "true")
+# -----------------------------
+# CORS
+# -----------------------------
+def _parse_allowed_origins() -> List[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    # sane defaults for local dev if not set
+    if not items:
+        items = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    return items
 
-default_origins = [
-    "http://localhost:3000",
-    "https://orchids-photo-finder-app.vercel.app",
-    "https://findme.clickcrowdmedia.com",
-    "https://www.findme.clickcrowdmedia.com",
-]
-
-allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
-allowed_origins = (
-    ["*"]
-    if cors_allow_all
-    else [o.strip() for o in allowed_origins_env.split(",") if o.strip()] or default_origins
-)
+ALLOWED_ORIGINS = _parse_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],   # incluye OPTIONS (preflight)
-    allow_headers=["*"],   # multipart/form-data + headers varios
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
     max_age=86400,
 )
 
-# --------------------------------------------------------------------
-# Supabase client (service role)
-# --------------------------------------------------------------------
+# -----------------------------
+# Supabase Admin
+# -----------------------------
 def supabase_admin() -> Client:
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -48,32 +47,33 @@ def supabase_admin() -> Client:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(url, key)
 
-
+# -----------------------------
+# Models
+# -----------------------------
 class ProcessRequest(BaseModel):
     fingerprint: str
-    uploadKey: str | None = None
+    uploadKey: Optional[str] = None
 
-
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "findme-api"}
-
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
 @app.get("/__version")
 def version():
-    return {"version": APP_VERSION}
-
+    return {"version": APP_VERSION, "allowedOrigins": ALLOWED_ORIGINS}
 
 @app.post("/upload")
 async def upload_zip(file: UploadFile = File(...)):
     """
     Upload ZIP to Supabase Storage bucket: uploads
-    Stored path: zips/<uuid>.zip
+    Stored path: zips/<random>.zip
     Returns { uploadKey, fingerprint }
     """
     sb = supabase_admin()
@@ -85,7 +85,7 @@ async def upload_zip(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    object_path = f"zips/{os.urandom(16).hex()}.zip"
+    object_path = f"zips/{uuid4().hex}.zip"
 
     res = sb.storage.from_("uploads").upload(
         path=object_path,
@@ -98,51 +98,44 @@ async def upload_zip(file: UploadFile = File(...)):
 
     return {"uploadKey": object_path, "fingerprint": object_path}
 
-
 @app.post("/process")
-def process_album(payload: ProcessRequest):
+def process_album(payload: ProcessRequest, background_tasks: BackgroundTasks):
     """
-    Creates album job record in DB.
-    For demo: auto-completes the job after creation.
+    Creates album job record in DB and kicks async processing:
+    - download ZIP
+    - extract images
+    - upload images to storage
+    - insert photos rows
     """
     sb = supabase_admin()
 
     if not payload.fingerprint:
         raise HTTPException(status_code=400, detail="fingerprint is required")
+    if not payload.uploadKey:
+        raise HTTPException(status_code=400, detail="uploadKey is required")
 
-    res = sb.table("albums").insert(
-        {
-            "fingerprint": payload.fingerprint,
-            "status": "pending",
-            "progress": 0,
-            "photo_count": 0,
-            "upload_key": payload.uploadKey,
-        }
-    ).execute()
+    res = sb.table("albums").insert({
+        "fingerprint": payload.fingerprint,
+        "status": "pending",
+        "progress": 0,
+        "photo_count": 0,
+        "upload_key": payload.uploadKey
+    }).execute()
 
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to create album")
 
     album_id = res.data[0]["id"]
 
-    # ✅ DEMO ONLY
-    time.sleep(1)
-
-    sb.table("albums").update({"status": "completed", "progress": 100}).eq("id", album_id).execute()
+    # Background processing (no blocking)
+    background_tasks.add_task(_process_zip_album, album_id, payload.uploadKey)
 
     return {"albumId": album_id}
-
 
 @app.get("/jobs/{album_id}")
 def get_job(album_id: str):
     sb = supabase_admin()
-    res = (
-        sb.table("albums")
-        .select("id,status,progress,error_message")
-        .eq("id", album_id)
-        .single()
-        .execute()
-    )
+    res = sb.table("albums").select("id,status,progress,error_message,photo_count").eq("id", album_id).single().execute()
 
     if not res.data:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -151,5 +144,96 @@ def get_job(album_id: str):
         "albumId": res.data["id"],
         "status": res.data["status"],
         "progress": res.data["progress"],
-        "errorMessage": res.data.get("error_message"),
+        "photoCount": res.data.get("photo_count", 0),
+        "errorMessage": res.data.get("error_message")
     }
+
+# -----------------------------
+# Background worker
+# -----------------------------
+def _is_image_filename(name: str) -> bool:
+    lower = name.lower()
+    return lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png") or lower.endswith(".webp")
+
+def _guess_mime(name: str) -> str:
+    mt, _ = mimetypes.guess_type(name)
+    return mt or "application/octet-stream"
+
+def _process_zip_album(album_id: str, upload_key: str):
+    sb = supabase_admin()
+
+    try:
+        # mark processing
+        sb.table("albums").update({
+            "status": "processing",
+            "progress": 5,
+            "error_message": None
+        }).eq("id", album_id).execute()
+
+        # download zip bytes from storage
+        zip_bytes = sb.storage.from_("uploads").download(upload_key)
+        if not zip_bytes:
+            raise RuntimeError("Failed to download ZIP (empty response)")
+
+        sb.table("albums").update({"progress": 10}).eq("id", album_id).execute()
+
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+
+        # collect image files
+        members = [m for m in zf.namelist() if m and not m.endswith("/") and _is_image_filename(m)]
+        if not members:
+            raise RuntimeError("ZIP contains no supported images (.jpg/.png/.webp)")
+
+        total = len(members)
+        inserted = 0
+
+        # optional: clear previous photos for this album (if reprocess)
+        # sb.table("photos").delete().eq("album_id", album_id).execute()
+
+        for idx, member in enumerate(members, start=1):
+            data = zf.read(member)
+            if not data:
+                continue
+
+            ext = os.path.splitext(member)[1].lower()
+            if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+                continue
+
+            object_path = f"albums/{album_id}/photos/{uuid4().hex}{ext}"
+            mime = _guess_mime(member)
+
+            up_res = sb.storage.from_("uploads").upload(
+                path=object_path,
+                file=data,
+                file_options={"content-type": mime},
+            )
+            if getattr(up_res, "error", None):
+                # fail fast: better to know than silently break
+                raise RuntimeError(f"Upload image failed: {up_res.error}")
+
+            # insert DB row
+            db_res = sb.table("photos").insert({
+                "album_id": album_id,
+                "storage_path": object_path
+            }).execute()
+
+            if db_res.data:
+                inserted += 1
+
+            # update progress (10 -> 95)
+            prog = 10 + int((idx / total) * 85)
+            sb.table("albums").update({"progress": prog}).eq("id", album_id).execute()
+
+        # finalize
+        sb.table("albums").update({
+            "status": "completed",
+            "progress": 100,
+            "photo_count": inserted
+        }).eq("id", album_id).execute()
+
+    except Exception as e:
+        sb.table("albums").update({
+            "status": "failed",
+            "progress": 0,
+            "error_message": str(e)
+        }).eq("id", album_id).execute()
