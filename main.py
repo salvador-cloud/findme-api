@@ -10,23 +10,16 @@ APP_VERSION = "v2026-02-02-1"
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
 # --------------------------------------------------------------------
-# CORS
+# CORS (FIX)
+# Orchids/Electron en preview está usando origin http://localhost:3000
 # --------------------------------------------------------------------
-# ✅ Recomendación: seteá en Fly un env var con tu dominio:
-#   ALLOWED_ORIGINS=https://findme.clickcrowdmedia.com,https://www.findme.clickcrowdmedia.com
-#
-# Si no está seteado, usamos defaults razonables.
-# Para debug rápido podés setear:
-#   CORS_ALLOW_ALL=true
-# y listo (NO recomendado permanente).
-# --------------------------------------------------------------------
-
 cors_allow_all = (os.getenv("CORS_ALLOW_ALL", "").lower() == "true")
 
 default_origins = [
-    "https://finde.clickcrowdmedia.com",
-    "https://orchids-photo-finder-app.vercel.app/",
-    "https://www.finde.clickcrowdmedia.com",
+    "http://localhost:3000",
+    "https://orchids-photo-finder-app.vercel.app",
+    "https://findme.clickcrowdmedia.com",
+    "https://www.findme.clickcrowdmedia.com",
 ]
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
@@ -39,10 +32,10 @@ allowed_origins = (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=False,   # True solo si usás cookies/sesión (hoy no hace falta)
-    allow_methods=["*"],       # incluye OPTIONS (preflight), POST, GET, etc.
-    allow_headers=["*"],       # Content-Type (multipart/form-data), Authorization, etc.
-    max_age=86400,             # cache del preflight 24h (reduce latencia)
+    allow_credentials=False,
+    allow_methods=["*"],   # incluye OPTIONS (preflight)
+    allow_headers=["*"],   # multipart/form-data + headers varios
+    max_age=86400,
 )
 
 # --------------------------------------------------------------------
@@ -132,12 +125,10 @@ def process_album(payload: ProcessRequest):
 
     album_id = res.data[0]["id"]
 
-    # ✅ DEMO ONLY: simulate some work, then mark completed
+    # ✅ DEMO ONLY
     time.sleep(1)
 
-    sb.table("albums").update(
-        {"status": "completed", "progress": 100}
-    ).eq("id", album_id).execute()
+    sb.table("albums").update({"status": "completed", "progress": 100}).eq("id", album_id).execute()
 
     return {"albumId": album_id}
 
@@ -162,4 +153,3 @@ def get_job(album_id: str):
         "progress": res.data["progress"],
         "errorMessage": res.data.get("error_message"),
     }
-
