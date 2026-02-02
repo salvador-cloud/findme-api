@@ -25,6 +25,7 @@ cors_allow_all = (os.getenv("CORS_ALLOW_ALL", "").lower() == "true")
 
 default_origins = [
     "https://finde.clickcrowdmedia.com",
+    "https://orchids-photo-finder-app.vercel.app/",
     "https://www.finde.clickcrowdmedia.com",
 ]
 
