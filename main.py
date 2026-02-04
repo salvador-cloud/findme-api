@@ -8,7 +8,6 @@ from typing import Optional, List, Dict, Any
 import numpy as np
 import cv2
 
-from insightface.app import FaceAnalysis
 from sklearn.cluster import DBSCAN
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Query
@@ -59,23 +58,29 @@ def _public_uploads_url(path: str) -> str:
     return f"{base}/storage/v1/object/public/uploads/{path}"
 
 # -----------------------------
-# Face model (singleton)
+# Face model (singleton, LAZY IMPORT)
 # -----------------------------
-_FACE_APP: Optional[FaceAnalysis] = None
+_FACE_APP = None  # type: ignore
 
-def _get_face_app() -> FaceAnalysis:
+def _load_face_analyzer():
+    """
+    Import lazy para que uvicorn NO muera en startup si onnxruntime falla.
+    """
+    from insightface.app import FaceAnalysis  # <-- import crítico SOLO acá
+    fa = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CPUExecutionProvider"],
+    )
+    fa.prepare(ctx_id=0, det_size=(640, 640))
+    return fa
+
+def _get_face_app():
     """
     Lazy singleton. CPU-only for Fly small instances.
     """
     global _FACE_APP
     if _FACE_APP is None:
-        fa = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CPUExecutionProvider"],
-        )
-        # det_size: más grande = mejor para caras chicas, pero más lento.
-        fa.prepare(ctx_id=0, det_size=(640, 640))
-        _FACE_APP = fa
+        _FACE_APP = _load_face_analyzer()
     return _FACE_APP
 
 # -----------------------------
@@ -271,6 +276,17 @@ def _process_zip_album(album_id: str, upload_key: str):
             "error_message": None
         }).eq("id", album_id).execute()
 
+        # 1) Intentamos inicializar InsightFace (pero sin tumbar el server)
+        try:
+            face_app = _get_face_app()
+        except Exception as e:
+            sb.table("albums").update({
+                "status": "failed",
+                "progress": 0,
+                "error_message": f"InsightFace init failed: {e}"
+            }).eq("id", album_id).execute()
+            return
+
         zip_bytes = sb.storage.from_("uploads").download(upload_key)
         if not zip_bytes:
             raise RuntimeError("Failed to download ZIP (empty response)")
@@ -335,7 +351,6 @@ def _process_zip_album(album_id: str, upload_key: str):
                 nparr = np.frombuffer(data, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if img is not None:
-                    face_app = _get_face_app()
                     faces = face_app.get(img)  # todas las caras
                     if faces:
                         for f in faces:
