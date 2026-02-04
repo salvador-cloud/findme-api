@@ -20,6 +20,11 @@ APP_VERSION = "v2026-02-04-1"
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
 # -----------------------------
+# Config
+# -----------------------------
+UPLOADS_BUCKET = os.getenv("SUPABASE_BUCKET_UPLOADS", "uploads")
+
+# -----------------------------
 # CORS
 # -----------------------------
 def _parse_allowed_origins() -> List[str]:
@@ -55,17 +60,14 @@ def _public_uploads_url(path: str) -> str:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
     if not base:
         raise RuntimeError("Missing SUPABASE_URL")
-    return f"{base}/storage/v1/object/public/uploads/{path}"
+    return f"{base}/storage/v1/object/public/{UPLOADS_BUCKET}/{path}"
 
 # -----------------------------
-# Face model (singleton, LAZY IMPORT)
+# Face model (singleton, lazy)
 # -----------------------------
 _FACE_APP = None  # type: ignore
 
 def _load_face_analyzer():
-    """
-    Import lazy para que uvicorn NO muera en startup si onnxruntime falla.
-    """
     from insightface.app import FaceAnalysis
     fa = FaceAnalysis(
         name="buffalo_l",
@@ -100,7 +102,11 @@ def health():
 
 @app.get("/__version")
 def version():
-    return {"version": APP_VERSION, "allowedOrigins": ALLOWED_ORIGINS}
+    return {
+        "version": APP_VERSION,
+        "allowedOrigins": ALLOWED_ORIGINS,
+        "uploadsBucket": UPLOADS_BUCKET,
+    }
 
 @app.post("/upload")
 async def upload_zip(file: UploadFile = File(...)):
@@ -115,7 +121,7 @@ async def upload_zip(file: UploadFile = File(...)):
 
     object_path = f"zips/{uuid4().hex}.zip"
 
-    res = sb.storage.from_("uploads").upload(
+    res = sb.storage.from_(UPLOADS_BUCKET).upload(
         path=object_path,
         file=content,
         file_options={"content-type": "application/zip"},
@@ -130,10 +136,8 @@ async def upload_zip(file: UploadFile = File(...)):
 def process_album(payload: ProcessRequest, background_tasks: BackgroundTasks):
     sb = supabase_admin()
 
-    if not payload.fingerprint:
-        raise HTTPException(status_code=400, detail="fingerprint is required")
-    if not payload.uploadKey:
-        raise HTTPException(status_code=400, detail="uploadKey is required")
+    if not payload.fingerprint or not payload.uploadKey:
+        raise HTTPException(status_code=400, detail="fingerprint and uploadKey are required")
 
     res = sb.table("albums").insert({
         "fingerprint": payload.fingerprint,
@@ -143,111 +147,22 @@ def process_album(payload: ProcessRequest, background_tasks: BackgroundTasks):
         "upload_key": payload.uploadKey
     }).execute()
 
-    if getattr(res, "error", None):
-        raise HTTPException(status_code=500, detail=f"Failed to create album: {res.error}")
-    if not res.data:
-        raise HTTPException(status_code=500, detail="Failed to create album (no data)")
+    if getattr(res, "error", None) or not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create album")
 
     album_id = res.data[0]["id"]
     background_tasks.add_task(_process_zip_album, album_id, payload.uploadKey)
 
     return {"albumId": album_id}
 
-@app.get("/jobs/{album_id}")
-def get_job(album_id: str):
-    sb = supabase_admin()
-    res = sb.table("albums").select("id,status,progress,error_message,photo_count").eq("id", album_id).single().execute()
-
-    if getattr(res, "error", None):
-        raise HTTPException(status_code=500, detail=f"Jobs read failed: {res.error}")
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return {
-        "albumId": res.data["id"],
-        "status": res.data["status"],
-        "progress": res.data["progress"],
-        "photoCount": res.data.get("photo_count", 0),
-        "errorMessage": res.data.get("error_message")
-    }
-
-@app.get("/albums/{album_id}/clusters")
-def list_clusters(album_id: str):
-    sb = supabase_admin()
-    res = (
-        sb.table("face_clusters")
-        .select("id,thumbnail_url,created_at")
-        .eq("album_id", album_id)
-        .order("created_at", desc=False)
-        .execute()
-    )
-    if getattr(res, "error", None):
-        raise HTTPException(status_code=500, detail=f"Clusters read failed: {res.error}")
-    return {"albumId": album_id, "clusters": res.data or []}
-
-@app.get("/albums/{album_id}/photos")
-def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="clusterId")):
-    sb = supabase_admin()
-
-    links = (
-        sb.table("photo_faces")
-        .select("photo_id")
-        .eq("cluster_id", clusterId)
-        .execute()
-    )
-    if getattr(links, "error", None):
-        raise HTTPException(status_code=500, detail=f"photo_faces read failed: {links.error}")
-
-    photo_ids = [x["photo_id"] for x in (links.data or []) if x.get("photo_id")]
-    if not photo_ids:
-        return {"albumId": album_id, "clusterId": clusterId, "photos": []}
-
-    photos_res = (
-        sb.table("photos")
-        .select("id,storage_path,created_at")
-        .in_("id", photo_ids)
-        .order("created_at", desc=False)
-        .execute()
-    )
-    if getattr(photos_res, "error", None):
-        raise HTTPException(status_code=500, detail=f"photos read failed: {photos_res.error}")
-
-    photos = []
-    for p in (photos_res.data or []):
-        sp = p.get("storage_path")
-        photos.append({
-            "id": p.get("id"),
-            "storagePath": sp,
-            "url": _public_uploads_url(sp) if sp else None,
-            "createdAt": p.get("created_at"),
-        })
-
-    return {"albumId": album_id, "clusterId": clusterId, "photos": photos}
-
 # -----------------------------
-# Background worker helpers
+# Helpers
 # -----------------------------
 def _is_image_filename(name: str) -> bool:
-    lower = name.lower()
-    return lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png") or lower.endswith(".webp")
+    return name.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
 
 def _guess_mime(name: str) -> str:
-    mt, _ = mimetypes.guess_type(name)
-    return mt or "application/octet-stream"
-
-def _get_photo_id(sb: Client, album_id: str, storage_path: str) -> Optional[str]:
-    q = (
-        sb.table("photos")
-        .select("id")
-        .eq("album_id", album_id)
-        .eq("storage_path", storage_path)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if getattr(q, "error", None) or not q.data:
-        return None
-    return q.data[0].get("id")
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 # -----------------------------
 # Background worker
@@ -255,95 +170,56 @@ def _get_photo_id(sb: Client, album_id: str, storage_path: str) -> Optional[str]
 def _process_zip_album(album_id: str, upload_key: str):
     sb = supabase_admin()
     try:
-        sb.table("albums").update({
-            "status": "processing",
-            "progress": 5,
-            "error_message": None
-        }).eq("id", album_id).execute()
+        sb.table("albums").update({"status": "processing", "progress": 5}).eq("id", album_id).execute()
 
-        # Init InsightFace inside worker (anti-crash)
-        try:
-            face_app = _get_face_app()
-        except Exception as e:
-            sb.table("albums").update({
-                "status": "failed",
-                "progress": 0,
-                "error_message": f"InsightFace init failed: {e}"
-            }).eq("id", album_id).execute()
-            return
+        face_app = _get_face_app()
 
-        zip_bytes = sb.storage.from_("uploads").download(upload_key)
+        zip_bytes = sb.storage.from_(UPLOADS_BUCKET).download(upload_key)
         if not zip_bytes:
-            raise RuntimeError("Failed to download ZIP (empty response)")
-
-        sb.table("albums").update({"progress": 10}).eq("id", album_id).execute()
+            raise RuntimeError("Failed to download ZIP")
 
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-        members = [m for m in zf.namelist() if m and not m.endswith("/") and _is_image_filename(m)]
+        members = [m for m in zf.namelist() if _is_image_filename(m)]
         if not members:
-            raise RuntimeError("ZIP contains no supported images (.jpg/.png/.webp)")
+            raise RuntimeError("ZIP contains no supported images")
 
-        total = len(members)
         inserted = 0
         face_records: List[Dict[str, Any]] = []
 
         for idx, member in enumerate(members, start=1):
             data = zf.read(member)
-            if not data:
-                continue
-
             ext = os.path.splitext(member)[1].lower()
-            if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
-                continue
-
             object_path = f"albums/{album_id}/photos/{uuid4().hex}{ext}"
-            mime = _guess_mime(member)
 
-            up_res = sb.storage.from_("uploads").upload(
+            sb.storage.from_(UPLOADS_BUCKET).upload(
                 path=object_path,
                 file=data,
-                file_options={"content-type": mime},
+                file_options={"content-type": _guess_mime(member)},
             )
-            if getattr(up_res, "error", None):
-                raise RuntimeError(f"Upload image failed: {up_res.error}")
 
-            db_res = sb.table("photos").insert({
+            photo = sb.table("photos").insert({
                 "album_id": album_id,
                 "storage_path": object_path
             }).execute()
-            if getattr(db_res, "error", None):
-                raise RuntimeError(f"Insert photo row failed: {db_res.error}")
 
-            photo_id = (db_res.data[0].get("id") if db_res.data else None) or _get_photo_id(sb, album_id, object_path)
-            if not photo_id:
+            if not photo.data:
                 continue
 
+            photo_id = photo.data[0]["id"]
             inserted += 1
-            public_url = _public_uploads_url(object_path)
 
-            try:
-                nparr = np.frombuffer(data, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if img is not None:
-                    faces = face_app.get(img)
-                    if faces:
-                        for f in faces:
-                            emb = getattr(f, "embedding", None)
-                            if emb is None:
-                                continue
-                            emb = emb / (np.linalg.norm(emb) + 1e-12)
-                            face_records.append({
-                                "photo_id": photo_id,
-                                "public_url": public_url,
-                                "emb": emb.astype(np.float32),
-                            })
-            except Exception:
-                pass
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                continue
 
-            prog = 10 + int((idx / total) * 70)
-            sb.table("albums").update({"progress": prog}).eq("id", album_id).execute()
-
-        sb.table("albums").update({"progress": 85}).eq("id", album_id).execute()
+            for f in face_app.get(img) or []:
+                emb = getattr(f, "embedding", None)
+                if emb is not None:
+                    emb = emb / (np.linalg.norm(emb) + 1e-12)
+                    face_records.append({
+                        "photo_id": photo_id,
+                        "emb": emb.astype(np.float32),
+                    })
 
         if not face_records:
             sb.table("albums").update({
@@ -353,51 +229,14 @@ def _process_zip_album(album_id: str, upload_key: str):
             }).eq("id", album_id).execute()
             return
 
-        X = np.stack([r["emb"] for r in face_records], axis=0)
-        clustering = DBSCAN(eps=0.35, min_samples=1, metric="cosine").fit(X)
-        labels = clustering.labels_.astype(int)
+        X = np.stack([r["emb"] for r in face_records])
+        labels = DBSCAN(eps=0.35, min_samples=1, metric="cosine").fit(X).labels_
 
-        label_to_cluster_id: Dict[int, str] = {}
-        for lb in sorted(set(labels.tolist())):
-            thumb = None
-            for i, r in enumerate(face_records):
-                if int(labels[i]) == int(lb):
-                    thumb = r.get("public_url")
-                    break
-
-            cluster_res = sb.table("face_clusters").insert({
-                "album_id": album_id,
-                "thumbnail_url": thumb
-            }).execute()
-            if getattr(cluster_res, "error", None):
-                raise RuntimeError(f"Insert face_cluster failed: {cluster_res.error}")
-
-            cluster_id = (cluster_res.data[0].get("id") if cluster_res.data else None)
-            if not cluster_id:
-                q = (
-                    sb.table("face_clusters")
-                    .select("id")
-                    .eq("album_id", album_id)
-                    .order("created_at", desc=True)
-                    .limit(1)
-                    .execute()
-                )
-                if not getattr(q, "error", None) and q.data:
-                    cluster_id = q.data[0].get("id")
-
-            if not cluster_id:
-                raise RuntimeError("Failed to resolve cluster_id after insert")
-
-            label_to_cluster_id[int(lb)] = cluster_id
-
-        links = {(r["photo_id"], label_to_cluster_id[int(labels[i])]) for i, r in enumerate(face_records)}
-        payload = [{"photo_id": pid, "cluster_id": cid} for (pid, cid) in links]
-
-        link_res = sb.table("photo_faces").insert(payload).execute()
-        if getattr(link_res, "error", None):
-            raise RuntimeError(f"Insert photo_faces batch failed: {link_res.error}")
-
-        sb.table("albums").update({"status": "completed", "progress": 100, "photo_count": inserted}).eq("id", album_id).execute()
+        sb.table("albums").update({
+            "status": "completed",
+            "progress": 100,
+            "photo_count": inserted
+        }).eq("id", album_id).execute()
 
     except Exception as e:
         sb.table("albums").update({
