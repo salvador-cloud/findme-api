@@ -1,10 +1,16 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+
+# Toolchain mínimo para compilar insightface (cython extension)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential g++ gcc \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-EXPOSE 8080
 
+ENV PYTHONUNBUFFERED=1
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
