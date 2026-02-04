@@ -66,7 +66,7 @@ def _load_face_analyzer():
     """
     Import lazy para que uvicorn NO muera en startup si onnxruntime falla.
     """
-    from insightface.app import FaceAnalysis  # <-- import crítico SOLO acá
+    from insightface.app import FaceAnalysis
     fa = FaceAnalysis(
         name="buffalo_l",
         providers=["CPUExecutionProvider"],
@@ -75,9 +75,6 @@ def _load_face_analyzer():
     return fa
 
 def _get_face_app():
-    """
-    Lazy singleton. CPU-only for Fly small instances.
-    """
     global _FACE_APP
     if _FACE_APP is None:
         _FACE_APP = _load_face_analyzer()
@@ -174,11 +171,9 @@ def get_job(album_id: str):
         "errorMessage": res.data.get("error_message")
     }
 
-# NEW: clusters list (personas)
 @app.get("/albums/{album_id}/clusters")
 def list_clusters(album_id: str):
     sb = supabase_admin()
-
     res = (
         sb.table("face_clusters")
         .select("id,thumbnail_url,created_at")
@@ -186,25 +181,20 @@ def list_clusters(album_id: str):
         .order("created_at", desc=False)
         .execute()
     )
-
     if getattr(res, "error", None):
         raise HTTPException(status_code=500, detail=f"Clusters read failed: {res.error}")
-
     return {"albumId": album_id, "clusters": res.data or []}
 
-# NEW: photos for a cluster/persona
 @app.get("/albums/{album_id}/photos")
 def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="clusterId")):
     sb = supabase_admin()
 
-    # 1) get photo_ids from photo_faces
     links = (
         sb.table("photo_faces")
         .select("photo_id")
         .eq("cluster_id", clusterId)
         .execute()
     )
-
     if getattr(links, "error", None):
         raise HTTPException(status_code=500, detail=f"photo_faces read failed: {links.error}")
 
@@ -212,7 +202,6 @@ def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="cl
     if not photo_ids:
         return {"albumId": album_id, "clusterId": clusterId, "photos": []}
 
-    # 2) fetch photos rows
     photos_res = (
         sb.table("photos")
         .select("id,storage_path,created_at")
@@ -220,7 +209,6 @@ def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="cl
         .order("created_at", desc=False)
         .execute()
     )
-
     if getattr(photos_res, "error", None):
         raise HTTPException(status_code=500, detail=f"photos read failed: {photos_res.error}")
 
@@ -257,9 +245,7 @@ def _get_photo_id(sb: Client, album_id: str, storage_path: str) -> Optional[str]
         .limit(1)
         .execute()
     )
-    if getattr(q, "error", None):
-        return None
-    if not q.data:
+    if getattr(q, "error", None) or not q.data:
         return None
     return q.data[0].get("id")
 
@@ -268,7 +254,6 @@ def _get_photo_id(sb: Client, album_id: str, storage_path: str) -> Optional[str]
 # -----------------------------
 def _process_zip_album(album_id: str, upload_key: str):
     sb = supabase_admin()
-
     try:
         sb.table("albums").update({
             "status": "processing",
@@ -276,7 +261,7 @@ def _process_zip_album(album_id: str, upload_key: str):
             "error_message": None
         }).eq("id", album_id).execute()
 
-        # 1) Intentamos inicializar InsightFace (pero sin tumbar el server)
+        # Init InsightFace inside worker (anti-crash)
         try:
             face_app = _get_face_app()
         except Exception as e:
@@ -300,9 +285,7 @@ def _process_zip_album(album_id: str, upload_key: str):
 
         total = len(members)
         inserted = 0
-
-        # vamos a almacenar embeddings para clustering
-        face_records: List[Dict[str, Any]] = []  # {photo_id, public_url, emb}
+        face_records: List[Dict[str, Any]] = []
 
         for idx, member in enumerate(members, start=1):
             data = zf.read(member)
@@ -328,55 +311,41 @@ def _process_zip_album(album_id: str, upload_key: str):
                 "album_id": album_id,
                 "storage_path": object_path
             }).execute()
-
             if getattr(db_res, "error", None):
                 raise RuntimeError(f"Insert photo row failed: {db_res.error}")
 
-            photo_id = None
-            if db_res.data and len(db_res.data) > 0:
-                photo_id = db_res.data[0].get("id")
-
+            photo_id = (db_res.data[0].get("id") if db_res.data else None) or _get_photo_id(sb, album_id, object_path)
             if not photo_id:
-                photo_id = _get_photo_id(sb, album_id, object_path)
-
-            if not photo_id:
-                # si no podemos resolver el id, seguimos
                 continue
 
             inserted += 1
             public_url = _public_uploads_url(object_path)
 
-            # --- Face detection + embeddings (desde bytes del ZIP) ---
             try:
                 nparr = np.frombuffer(data, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if img is not None:
-                    faces = face_app.get(img)  # todas las caras
+                    faces = face_app.get(img)
                     if faces:
                         for f in faces:
                             emb = getattr(f, "embedding", None)
                             if emb is None:
                                 continue
-                            emb = emb / (np.linalg.norm(emb) + 1e-12)  # normalize
+                            emb = emb / (np.linalg.norm(emb) + 1e-12)
                             face_records.append({
                                 "photo_id": photo_id,
                                 "public_url": public_url,
                                 "emb": emb.astype(np.float32),
                             })
             except Exception:
-                # MVP: no frenamos el job entero por 1 imagen
                 pass
 
-            prog = 10 + int((idx / total) * 70)  # 10 -> 80
+            prog = 10 + int((idx / total) * 70)
             sb.table("albums").update({"progress": prog}).eq("id", album_id).execute()
 
-        # -----------------------------------
-        # REAL CLUSTERING: clusters = personas
-        # -----------------------------------
         sb.table("albums").update({"progress": 85}).eq("id", album_id).execute()
 
         if not face_records:
-            # No hubo caras detectadas. Termina OK pero sin clusters.
             sb.table("albums").update({
                 "status": "completed",
                 "progress": 100,
@@ -385,17 +354,11 @@ def _process_zip_album(album_id: str, upload_key: str):
             return
 
         X = np.stack([r["emb"] for r in face_records], axis=0)
-
-        # eps es tu “control knob” principal
         clustering = DBSCAN(eps=0.35, min_samples=1, metric="cosine").fit(X)
         labels = clustering.labels_.astype(int)
 
-        # label -> cluster_id
         label_to_cluster_id: Dict[int, str] = {}
-
-        unique_labels = sorted(set(labels.tolist()))
-        for lb in unique_labels:
-            # thumbnail: primera foto que aparezca en el cluster
+        for lb in sorted(set(labels.tolist())):
             thumb = None
             for i, r in enumerate(face_records):
                 if int(labels[i]) == int(lb):
@@ -406,16 +369,11 @@ def _process_zip_album(album_id: str, upload_key: str):
                 "album_id": album_id,
                 "thumbnail_url": thumb
             }).execute()
-
             if getattr(cluster_res, "error", None):
                 raise RuntimeError(f"Insert face_cluster failed: {cluster_res.error}")
 
-            cluster_id = None
-            if cluster_res.data and len(cluster_res.data) > 0:
-                cluster_id = cluster_res.data[0].get("id")
-
+            cluster_id = (cluster_res.data[0].get("id") if cluster_res.data else None)
             if not cluster_id:
-                # fallback: tomamos el último creado para este álbum
                 q = (
                     sb.table("face_clusters")
                     .select("id")
@@ -432,25 +390,14 @@ def _process_zip_album(album_id: str, upload_key: str):
 
             label_to_cluster_id[int(lb)] = cluster_id
 
-        # Link photo_faces (dedupe por (photo_id, cluster_id))
-        links = set()
-        for i, r in enumerate(face_records):
-            pid = r["photo_id"]
-            cid = label_to_cluster_id[int(labels[i])]
-            links.add((pid, cid))
-
+        links = {(r["photo_id"], label_to_cluster_id[int(labels[i])]) for i, r in enumerate(face_records)}
         payload = [{"photo_id": pid, "cluster_id": cid} for (pid, cid) in links]
+
         link_res = sb.table("photo_faces").insert(payload).execute()
         if getattr(link_res, "error", None):
             raise RuntimeError(f"Insert photo_faces batch failed: {link_res.error}")
 
-        sb.table("albums").update({"progress": 95}).eq("id", album_id).execute()
-
-        sb.table("albums").update({
-            "status": "completed",
-            "progress": 100,
-            "photo_count": inserted
-        }).eq("id", album_id).execute()
+        sb.table("albums").update({"status": "completed", "progress": 100, "photo_count": inserted}).eq("id", album_id).execute()
 
     except Exception as e:
         sb.table("albums").update({
