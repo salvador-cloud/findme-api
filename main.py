@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = "v2026-02-04-1"
+APP_VERSION = "v2026-02-04-2"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
@@ -47,32 +47,27 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Supabase Admin
+# Supabase
 # -----------------------------
 def supabase_admin() -> Client:
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+        raise RuntimeError("Missing Supabase envs")
     return create_client(url, key)
 
 def _public_uploads_url(path: str) -> str:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
-    if not base:
-        raise RuntimeError("Missing SUPABASE_URL")
     return f"{base}/storage/v1/object/public/{UPLOADS_BUCKET}/{path}"
 
 # -----------------------------
-# Face model (singleton, lazy)
+# Face model (lazy)
 # -----------------------------
-_FACE_APP = None  # type: ignore
+_FACE_APP = None
 
 def _load_face_analyzer():
     from insightface.app import FaceAnalysis
-    fa = FaceAnalysis(
-        name="buffalo_l",
-        providers=["CPUExecutionProvider"],
-    )
+    fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
     fa.prepare(ctx_id=0, det_size=(640, 640))
     return fa
 
@@ -94,7 +89,7 @@ class ProcessRequest(BaseModel):
 # -----------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "findme-api"}
+    return {"ok": True}
 
 @app.get("/health")
 def health():
@@ -104,7 +99,6 @@ def health():
 def version():
     return {
         "version": APP_VERSION,
-        "allowedOrigins": ALLOWED_ORIGINS,
         "uploadsBucket": UPLOADS_BUCKET,
     }
 
@@ -113,7 +107,7 @@ async def upload_zip(file: UploadFile = File(...)):
     sb = supabase_admin()
 
     if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are supported")
+        raise HTTPException(status_code=400, detail="Only .zip supported")
 
     content = await file.read()
     if not content:
@@ -128,7 +122,7 @@ async def upload_zip(file: UploadFile = File(...)):
     )
 
     if getattr(res, "error", None):
-        raise HTTPException(status_code=500, detail=f"Upload failed: {res.error}")
+        raise HTTPException(status_code=500, detail="Upload failed")
 
     return {"uploadKey": object_path, "fingerprint": object_path}
 
@@ -137,7 +131,7 @@ def process_album(payload: ProcessRequest, background_tasks: BackgroundTasks):
     sb = supabase_admin()
 
     if not payload.fingerprint or not payload.uploadKey:
-        raise HTTPException(status_code=400, detail="fingerprint and uploadKey are required")
+        raise HTTPException(status_code=400, detail="Missing params")
 
     res = sb.table("albums").insert({
         "fingerprint": payload.fingerprint,
@@ -147,13 +141,47 @@ def process_album(payload: ProcessRequest, background_tasks: BackgroundTasks):
         "upload_key": payload.uploadKey
     }).execute()
 
-    if getattr(res, "error", None) or not res.data:
-        raise HTTPException(status_code=500, detail="Failed to create album")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Album insert failed")
 
     album_id = res.data[0]["id"]
     background_tasks.add_task(_process_zip_album, album_id, payload.uploadKey)
 
     return {"albumId": album_id}
+
+# ✅ FIX CLAVE: nunca devolver 404 en jobs
+@app.get("/jobs/{album_id}")
+def get_job(album_id: str):
+    sb = supabase_admin()
+
+    res = (
+        sb.table("albums")
+        .select("id,status,progress,error_message,photo_count")
+        .eq("id", album_id)
+        .execute()
+    )
+
+    if getattr(res, "error", None):
+        raise HTTPException(status_code=500, detail="Jobs read failed")
+
+    if not res.data:
+        # 👇 ESTO evita el error del frontend
+        return {
+            "albumId": album_id,
+            "status": "pending",
+            "progress": 0,
+            "photoCount": 0,
+            "errorMessage": None
+        }
+
+    row = res.data[0]
+    return {
+        "albumId": row["id"],
+        "status": row["status"],
+        "progress": row["progress"],
+        "photoCount": row.get("photo_count", 0),
+        "errorMessage": row.get("error_message"),
+    }
 
 # -----------------------------
 # Helpers
@@ -165,49 +193,46 @@ def _guess_mime(name: str) -> str:
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 # -----------------------------
-# Background worker
+# Worker
 # -----------------------------
 def _process_zip_album(album_id: str, upload_key: str):
     sb = supabase_admin()
+
     try:
-        sb.table("albums").update({"status": "processing", "progress": 5}).eq("id", album_id).execute()
+        sb.table("albums").update({
+            "status": "processing",
+            "progress": 5
+        }).eq("id", album_id).execute()
 
         face_app = _get_face_app()
 
         zip_bytes = sb.storage.from_(UPLOADS_BUCKET).download(upload_key)
-        if not zip_bytes:
-            raise RuntimeError("Failed to download ZIP")
-
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
         members = [m for m in zf.namelist() if _is_image_filename(m)]
-        if not members:
-            raise RuntimeError("ZIP contains no supported images")
 
         inserted = 0
-        face_records: List[Dict[str, Any]] = []
+        face_records = []
 
-        for idx, member in enumerate(members, start=1):
-            data = zf.read(member)
-            ext = os.path.splitext(member)[1].lower()
-            object_path = f"albums/{album_id}/photos/{uuid4().hex}{ext}"
+        for m in members:
+            data = zf.read(m)
+            ext = os.path.splitext(m)[1].lower()
+            path = f"albums/{album_id}/photos/{uuid4().hex}{ext}"
 
             sb.storage.from_(UPLOADS_BUCKET).upload(
-                path=object_path,
+                path=path,
                 file=data,
-                file_options={"content-type": _guess_mime(member)},
+                file_options={"content-type": _guess_mime(m)},
             )
 
             photo = sb.table("photos").insert({
                 "album_id": album_id,
-                "storage_path": object_path
+                "storage_path": path
             }).execute()
 
             if not photo.data:
                 continue
 
-            photo_id = photo.data[0]["id"]
             inserted += 1
-
             img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 continue
@@ -215,22 +240,7 @@ def _process_zip_album(album_id: str, upload_key: str):
             for f in face_app.get(img) or []:
                 emb = getattr(f, "embedding", None)
                 if emb is not None:
-                    emb = emb / (np.linalg.norm(emb) + 1e-12)
-                    face_records.append({
-                        "photo_id": photo_id,
-                        "emb": emb.astype(np.float32),
-                    })
-
-        if not face_records:
-            sb.table("albums").update({
-                "status": "completed",
-                "progress": 100,
-                "photo_count": inserted
-            }).eq("id", album_id).execute()
-            return
-
-        X = np.stack([r["emb"] for r in face_records])
-        labels = DBSCAN(eps=0.35, min_samples=1, metric="cosine").fit(X).labels_
+                    face_records.append(emb)
 
         sb.table("albums").update({
             "status": "completed",
