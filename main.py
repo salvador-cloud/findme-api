@@ -1,7 +1,7 @@
 import os
 import mimetypes
 from uuid import uuid4
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,7 +49,7 @@ def supabase_admin() -> Client:
         raise RuntimeError("Missing Supabase envs")
     return create_client(url, key)
 
-def _public_uploads_url(path: str) -> str:
+def _public_uploads_url(path: str) -> Optional[str]:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
     if not base:
         return None
@@ -105,7 +105,7 @@ async def upload_zip(file: UploadFile = File(...)):
 
     return {"uploadKey": object_path, "fingerprint": object_path}
 
-# ✅ CAMBIO CLAVE: /process SOLO crea el album en DB y devuelve albumId
+# ✅ /process SOLO crea el album en DB y devuelve albumId
 @app.post("/process")
 def process_album(payload: ProcessRequest):
     sb = supabase_admin()
@@ -115,7 +115,7 @@ def process_album(payload: ProcessRequest):
 
     res = sb.table("albums").insert({
         "fingerprint": payload.fingerprint,
-        "status": "pending",
+        "status": "queued",          # <- semántica mejor para worker
         "progress": 0,
         "photo_count": 0,
         "upload_key": payload.uploadKey,
@@ -128,7 +128,7 @@ def process_album(payload: ProcessRequest):
     album_id = res.data[0]["id"]
     return {"albumId": album_id}
 
-# ✅ FIX CLAVE: nunca devolver 404 en jobs (para evitar “connection issue” del front)
+# ✅ FIX CLAVE: nunca devolver 404 en jobs (evita “connection issue” del front)
 @app.get("/jobs/{album_id}")
 def get_job(album_id: str):
     sb = supabase_admin()
@@ -146,7 +146,7 @@ def get_job(album_id: str):
     if not res.data:
         return {
             "albumId": album_id,
-            "status": "pending",
+            "status": "queued",     # <- consistente con /process
             "progress": 0,
             "photoCount": 0,
             "errorMessage": None
