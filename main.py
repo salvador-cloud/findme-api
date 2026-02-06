@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = "v2026-02-04-3"
+APP_VERSION = "v2026-02-06-worker-linked"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
@@ -81,6 +81,9 @@ def version():
         "allowedOrigins": ALLOWED_ORIGINS,
     }
 
+# -----------------------------
+# Upload ZIP
+# -----------------------------
 @app.post("/upload")
 async def upload_zip(file: UploadFile = File(...)):
     sb = supabase_admin()
@@ -105,7 +108,9 @@ async def upload_zip(file: UploadFile = File(...)):
 
     return {"uploadKey": object_path, "fingerprint": object_path}
 
-# ✅ /process SOLO crea el album en DB y devuelve albumId
+# -----------------------------
+# PROCESS (ahora crea JOB)
+# -----------------------------
 @app.post("/process")
 def process_album(payload: ProcessRequest):
     sb = supabase_admin()
@@ -113,22 +118,80 @@ def process_album(payload: ProcessRequest):
     if not payload.fingerprint or not payload.uploadKey:
         raise HTTPException(status_code=400, detail="Missing params")
 
-    res = sb.table("albums").insert({
-        "fingerprint": payload.fingerprint,
-        "status": "queued",          # <- semántica mejor para worker
-        "progress": 0,
-        "photo_count": 0,
-        "upload_key": payload.uploadKey,
-        "error_message": None,
+    fingerprint = payload.fingerprint.strip()
+    upload_key = payload.uploadKey.strip()
+
+    # 1️⃣ Buscar album existente
+    existing = (
+        sb.table("albums")
+        .select("id,status")
+        .eq("fingerprint", fingerprint)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    album_id = None
+
+    if not getattr(existing, "error", None) and existing.data:
+        row = existing.data[0]
+        if row.get("status") in ("queued", "processing"):
+            album_id = row["id"]
+
+    # 2️⃣ Crear album si no existe uno reutilizable
+    if not album_id:
+        res = sb.table("albums").insert({
+            "fingerprint": fingerprint,
+            "status": "queued",
+            "progress": 0,
+            "photo_count": 0,
+            "upload_key": upload_key,
+            "error_message": None,
+        }).execute()
+
+        if getattr(res, "error", None) or not res.data:
+            raise HTTPException(status_code=500, detail="Album insert failed")
+
+        album_id = res.data[0]["id"]
+
+    # 3️⃣ Verificar si ya hay job activo
+    job_check = (
+        sb.table("jobs")
+        .select("id,status")
+        .eq("album_id", album_id)
+        .in_("status", ["pending", "processing"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if getattr(job_check, "error", None):
+        raise HTTPException(status_code=500, detail="Jobs read failed")
+
+    if job_check.data:
+        job_id = job_check.data[0]["id"]
+        return {"albumId": album_id, "jobId": job_id}
+
+    # 4️⃣ Crear job nuevo
+    job_id = str(uuid4())
+
+    job_res = sb.table("jobs").insert({
+        "id": job_id,
+        "status": "pending",
+        "album_id": album_id,
+        "zip_path": upload_key,
+        "error": None,
+        "result": None,
     }).execute()
 
-    if getattr(res, "error", None) or not res.data:
-        raise HTTPException(status_code=500, detail="Album insert failed")
+    if getattr(job_res, "error", None):
+        raise HTTPException(status_code=500, detail="Job insert failed")
 
-    album_id = res.data[0]["id"]
-    return {"albumId": album_id}
+    return {"albumId": album_id, "jobId": job_id}
 
-# ✅ FIX CLAVE: nunca devolver 404 en jobs (evita “connection issue” del front)
+# -----------------------------
+# JOB STATUS (lee albums)
+# -----------------------------
 @app.get("/jobs/{album_id}")
 def get_job(album_id: str):
     sb = supabase_admin()
@@ -146,13 +209,14 @@ def get_job(album_id: str):
     if not res.data:
         return {
             "albumId": album_id,
-            "status": "queued",     # <- consistente con /process
+            "status": "queued",
             "progress": 0,
             "photoCount": 0,
             "errorMessage": None
         }
 
     row = res.data[0]
+
     return {
         "albumId": row["id"],
         "status": row["status"],
@@ -162,7 +226,7 @@ def get_job(album_id: str):
     }
 
 # -----------------------------
-# Clusters + Photos (lo llena el worker)
+# CLUSTERS
 # -----------------------------
 @app.get("/albums/{album_id}/clusters")
 def list_clusters(album_id: str):
@@ -181,6 +245,9 @@ def list_clusters(album_id: str):
 
     return {"albumId": album_id, "clusters": res.data or []}
 
+# -----------------------------
+# PHOTOS POR CLUSTER
+# -----------------------------
 @app.get("/albums/{album_id}/photos")
 def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="clusterId")):
     sb = supabase_admin()
@@ -191,10 +258,12 @@ def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="cl
         .eq("cluster_id", clusterId)
         .execute()
     )
+
     if getattr(links, "error", None):
         raise HTTPException(status_code=500, detail="photo_faces read failed")
 
     photo_ids = [x["photo_id"] for x in (links.data or []) if x.get("photo_id")]
+
     if not photo_ids:
         return {"albumId": album_id, "clusterId": clusterId, "photos": []}
 
@@ -205,6 +274,7 @@ def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="cl
         .order("created_at", desc=False)
         .execute()
     )
+
     if getattr(photos_res, "error", None):
         raise HTTPException(status_code=500, detail="photos read failed")
 
