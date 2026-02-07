@@ -21,7 +21,7 @@ app = FastAPI(title="findme-api", version=APP_VERSION)
 UPLOADS_BUCKET = os.getenv("SUPABASE_BUCKET_UPLOADS", "uploads")
 
 # P0 guards (API-side)
-MAX_ZIP_MB = int(os.getenv("MAX_ZIP_MB", "30"))
+MAX_ZIP_MB = int(os.getenv("MAX_ZIP_MB", "50"))
 MAX_PHOTOS_PER_ALBUM = int(os.getenv("MAX_PHOTOS_PER_ALBUM", "500"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
