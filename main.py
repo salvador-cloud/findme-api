@@ -2,16 +2,19 @@ import os
 import io
 import zipfile
 import requests
+import hashlib
+import secrets
+import string
 from uuid import uuid4
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = "v2026-02-08-p0-guards-download-delete"
+APP_VERSION = "v2026-02-08-p0-guards-download-delete-recoverycode"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
@@ -25,6 +28,10 @@ MAX_ZIP_MB = int(os.getenv("MAX_ZIP_MB", "50"))
 MAX_PHOTOS_PER_ALBUM = int(os.getenv("MAX_PHOTOS_PER_ALBUM", "500"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
+# Recovery code (anti-abuse)
+ALBUM_CODE_SALT = os.getenv("ALBUM_CODE_SALT", "")  # REQUIRED in Fly secrets for API
+
+
 # -----------------------------
 # CORS
 # -----------------------------
@@ -34,6 +41,7 @@ def _parse_allowed_origins() -> List[str]:
     if not items:
         items = ["http://localhost:3000", "http://127.0.0.1:3000"]
     return items
+
 
 ALLOWED_ORIGINS = _parse_allowed_origins()
 
@@ -57,11 +65,107 @@ def supabase_admin() -> Client:
         raise RuntimeError("Missing Supabase envs")
     return create_client(url, key)
 
+
 def _public_uploads_url(path: str) -> Optional[str]:
     base = os.getenv("SUPABASE_URL", "").rstrip("/")
     if not base or not path:
         return None
     return f"{base}/storage/v1/object/public/{UPLOADS_BUCKET}/{path.lstrip('/')}"
+
+
+# -----------------------------
+# Recovery code helpers
+# -----------------------------
+def _require_code_salt() -> None:
+    # We only hard-require the salt for endpoints that need auth.
+    # Keeping API boot flexible to avoid unexpected crashes in dev.
+    if not ALBUM_CODE_SALT:
+        raise RuntimeError("Missing ALBUM_CODE_SALT env (set as Fly secret on API app)")
+
+
+def _generate_recovery_code(length: int = 12) -> str:
+    """
+    Generates a human-friendly code (no 0/O/1/I confusion).
+    Example: K7M9-2XPD-RQ5A (groups for readability).
+    """
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # base32-like, avoids 0O1I
+    raw = "".join(secrets.choice(alphabet) for _ in range(length))
+    # group as XXXX-XXXX-XXXX (or whatever fits)
+    if length >= 12:
+        return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
+    if length >= 8:
+        return f"{raw[0:4]}-{raw[4:8]}"
+    return raw
+
+
+def _normalize_code(code: str) -> str:
+    return (code or "").strip().upper().replace(" ", "").replace("_", "-")
+
+
+def _hash_code(code: str) -> str:
+    _require_code_salt()
+    c = _normalize_code(code)
+    data = (ALBUM_CODE_SALT + ":" + c).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _hint_from_code(code: str) -> str:
+    c = _normalize_code(code)
+    # show last 4 alnum-ish chars (ignoring dashes)
+    clean = c.replace("-", "")
+    return clean[-4:] if len(clean) >= 4 else clean
+
+
+def _get_album_code_or_403(x_album_code: Optional[str], code_qs: Optional[str]) -> str:
+    code = x_album_code or code_qs
+    if not code:
+        raise HTTPException(status_code=403, detail="Missing album code")
+    return code
+
+
+def _require_album_access(
+    sb: Client,
+    album_id: str,
+    x_album_code: Optional[str],
+    code_qs: Optional[str],
+) -> None:
+    """
+    Enforces recovery code if album has access_code_hash set.
+    Backward compatible: if column is null/empty, allow.
+    """
+    # read hash from album
+    res = (
+        sb.table("albums")
+        .select("id,access_code_hash,access_code_hint")
+        .eq("id", album_id)
+        .limit(1)
+        .execute()
+    )
+    if getattr(res, "error", None):
+        raise HTTPException(status_code=500, detail="albums read failed")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    row = res.data[0]
+    stored_hash = (row.get("access_code_hash") or "").strip()
+    if not stored_hash:
+        # no auth configured => allow (backward compat)
+        return
+
+    # validate provided code
+    provided = _get_album_code_or_403(x_album_code, code_qs)
+    try:
+        provided_hash = _hash_code(provided)
+    except RuntimeError:
+        # salt missing => treat as server misconfig
+        raise HTTPException(status_code=500, detail="Server misconfigured (missing ALBUM_CODE_SALT)")
+
+    if provided_hash != stored_hash:
+        hint = row.get("access_code_hint")
+        if hint:
+            raise HTTPException(status_code=403, detail=f"Invalid album code (hint: ****{hint})")
+        raise HTTPException(status_code=403, detail="Invalid album code")
+
 
 # -----------------------------
 # Models
@@ -70,6 +174,7 @@ class ProcessRequest(BaseModel):
     fingerprint: str
     uploadKey: Optional[str] = None
 
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -77,9 +182,11 @@ class ProcessRequest(BaseModel):
 def root():
     return {"ok": True}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/__version")
 def version():
@@ -91,7 +198,13 @@ def version():
             "maxZipMB": MAX_ZIP_MB,
             "maxPhotosPerAlbum": MAX_PHOTOS_PER_ALBUM,
         },
+        "recoveryCode": {
+            "enabled": True,
+            "requiresSalt": True,
+            "saltConfigured": bool(ALBUM_CODE_SALT),
+        },
     }
+
 
 # -----------------------------
 # ZIP helpers (API-side validation)
@@ -111,6 +224,7 @@ def _count_images_in_zip(zip_bytes: bytes) -> int:
         if count > MAX_PHOTOS_PER_ALBUM:
             break
     return count
+
 
 # -----------------------------
 # Upload ZIP
@@ -152,8 +266,9 @@ async def upload_zip(file: UploadFile = File(...)):
     # mantenemos tu contrato de respuesta
     return {"uploadKey": object_path, "fingerprint": object_path}
 
+
 # -----------------------------
-# PROCESS (crea/reusa album + crea JOB)
+# PROCESS (crea/reusa album + crea JOB + genera recoveryCode para album nuevo)
 # -----------------------------
 @app.post("/process")
 def process_album(payload: ProcessRequest):
@@ -168,7 +283,7 @@ def process_album(payload: ProcessRequest):
     # 1️⃣ Buscar album existente reutilizable
     existing = (
         sb.table("albums")
-        .select("id,status")
+        .select("id,status,access_code_hash")
         .eq("fingerprint", fingerprint)
         .order("created_at", desc=True)
         .limit(1)
@@ -176,21 +291,48 @@ def process_album(payload: ProcessRequest):
     )
 
     album_id = None
+    reused = False
+
     if not getattr(existing, "error", None) and existing.data:
         row = existing.data[0]
         if row.get("status") in ("queued", "processing"):
             album_id = row["id"]
+            reused = True
+
+    recovery_code: Optional[str] = None
 
     # 2️⃣ Crear album si no existe uno reutilizable
     if not album_id:
-        res = sb.table("albums").insert({
+        # Generate code ONCE for a brand new album
+        # If ALBUM_CODE_SALT missing, we still create album (backward compat),
+        # but recovery code won't be enabled.
+        try:
+            _require_code_salt()
+            recovery_code = _generate_recovery_code(12)
+            code_hash = _hash_code(recovery_code)
+            code_hint = _hint_from_code(recovery_code)
+            code_created_at = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            recovery_code = None
+            code_hash = None
+            code_hint = None
+            code_created_at = None
+
+        insert_payload: Dict[str, Any] = {
             "fingerprint": fingerprint,
             "status": "queued",
             "progress": 0,
             "photo_count": 0,
             "upload_key": upload_key,
             "error_message": None,
-        }).execute()
+        }
+        # only set if columns exist + salt configured
+        if code_hash:
+            insert_payload["access_code_hash"] = code_hash
+            insert_payload["access_code_hint"] = code_hint
+            insert_payload["access_code_created_at"] = code_created_at
+
+        res = sb.table("albums").insert(insert_payload).execute()
 
         if getattr(res, "error", None) or not res.data:
             raise HTTPException(status_code=500, detail="Album insert failed")
@@ -213,27 +355,38 @@ def process_album(payload: ProcessRequest):
 
     if job_check.data:
         job_id = job_check.data[0]["id"]
-        return {"albumId": album_id, "jobId": job_id}
+        # IMPORTANT: never re-issue recoveryCode for reused albums
+        resp = {"albumId": album_id, "jobId": job_id}
+        if recovery_code and not reused:
+            resp["recoveryCode"] = recovery_code
+        return resp
 
     # 4️⃣ Crear job nuevo
     job_id = str(uuid4())
 
-    job_res = sb.table("jobs").insert({
-        "id": job_id,
-        "status": "pending",
-        "album_id": album_id,
-        "zip_path": upload_key,
-        "error": None,
-        "result": None,
-    }).execute()
+    job_res = sb.table("jobs").insert(
+        {
+            "id": job_id,
+            "status": "pending",
+            "album_id": album_id,
+            "zip_path": upload_key,
+            "error": None,
+            "result": None,
+        }
+    ).execute()
 
     if getattr(job_res, "error", None):
         raise HTTPException(status_code=500, detail="Job insert failed")
 
-    return {"albumId": album_id, "jobId": job_id}
+    resp = {"albumId": album_id, "jobId": job_id}
+    if recovery_code and not reused:
+        resp["recoveryCode"] = recovery_code
+    return resp
+
 
 # -----------------------------
 # JOB STATUS (lee albums)
+# NOTE: lo dejamos sin auth para que el polling funcione sin fricción.
 # -----------------------------
 @app.get("/jobs/{album_id}")
 def get_job(album_id: str):
@@ -255,7 +408,7 @@ def get_job(album_id: str):
             "status": "queued",
             "progress": 0,
             "photoCount": 0,
-            "errorMessage": None
+            "errorMessage": None,
         }
 
     row = res.data[0]
@@ -267,12 +420,18 @@ def get_job(album_id: str):
         "errorMessage": row.get("error_message"),
     }
 
+
 # -----------------------------
-# CLUSTERS
+# CLUSTERS (protected)
 # -----------------------------
 @app.get("/albums/{album_id}/clusters")
-def list_clusters(album_id: str):
+def list_clusters(
+    album_id: str,
+    x_album_code: Optional[str] = Header(default=None, alias="X-Album-Code"),
+    code: Optional[str] = Query(default=None, alias="code"),
+):
     sb = supabase_admin()
+    _require_album_access(sb, album_id, x_album_code, code)
 
     res = (
         sb.table("face_clusters")
@@ -287,12 +446,19 @@ def list_clusters(album_id: str):
 
     return {"albumId": album_id, "clusters": res.data or []}
 
+
 # -----------------------------
-# PHOTOS POR CLUSTER
+# PHOTOS POR CLUSTER (protected)
 # -----------------------------
 @app.get("/albums/{album_id}/photos")
-def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="clusterId")):
+def list_photos_for_cluster(
+    album_id: str,
+    clusterId: str = Query(..., alias="clusterId"),
+    x_album_code: Optional[str] = Header(default=None, alias="X-Album-Code"),
+    code: Optional[str] = Query(default=None, alias="code"),
+):
     sb = supabase_admin()
+    _require_album_access(sb, album_id, x_album_code, code)
 
     links = (
         sb.table("photo_faces")
@@ -323,21 +489,30 @@ def list_photos_for_cluster(album_id: str, clusterId: str = Query(..., alias="cl
     photos = []
     for p in (photos_res.data or []):
         sp = p.get("storage_path")
-        photos.append({
-            "id": p.get("id"),
-            "storagePath": sp,
-            "url": _public_uploads_url(sp) if sp else None,
-            "createdAt": p.get("created_at"),
-        })
+        photos.append(
+            {
+                "id": p.get("id"),
+                "storagePath": sp,
+                "url": _public_uploads_url(sp) if sp else None,
+                "createdAt": p.get("created_at"),
+            }
+        )
 
     return {"albumId": album_id, "clusterId": clusterId, "photos": photos}
 
+
 # -----------------------------
-# DOWNLOAD ZIP POR CLUSTER (P0)
+# DOWNLOAD ZIP POR CLUSTER (protected)
 # -----------------------------
 @app.get("/albums/{album_id}/download")
-def download_cluster(album_id: str, clusterId: str = Query(..., alias="clusterId")):
+def download_cluster(
+    album_id: str,
+    clusterId: str = Query(..., alias="clusterId"),
+    x_album_code: Optional[str] = Header(default=None, alias="X-Album-Code"),
+    code: Optional[str] = Query(default=None, alias="code"),
+):
     sb = supabase_admin()
+    _require_album_access(sb, album_id, x_album_code, code)
 
     links = (
         sb.table("photo_faces")
@@ -394,17 +569,21 @@ def download_cluster(album_id: str, clusterId: str = Query(..., alias="clusterId
     return Response(
         content=data,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="findme_{album_id}_{clusterId}.zip"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="findme_{album_id}_{clusterId}.zip"'},
     )
 
+
 # -----------------------------
-# DELETE ALBUM (P0 panic button)
+# DELETE ALBUM (protected)
 # -----------------------------
 @app.delete("/albums/{album_id}")
-def delete_album(album_id: str):
+def delete_album(
+    album_id: str,
+    x_album_code: Optional[str] = Header(default=None, alias="X-Album-Code"),
+    code: Optional[str] = Query(default=None, alias="code"),
+):
     sb = supabase_admin()
+    _require_album_access(sb, album_id, x_album_code, code)
 
     photos = (
         sb.table("photos")
