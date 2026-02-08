@@ -4,6 +4,7 @@ import zipfile
 import requests
 import hashlib
 import secrets
+import redis
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Optional, List, Dict, Any, Tuple
@@ -14,7 +15,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = "v2026-02-08-p2-paging-lazy-recoverycode"
+APP_VERSION = "v2026-02-08-p3-rq-redis-queue"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
@@ -35,6 +36,32 @@ DEFAULT_PHOTOS_LIMIT = int(os.getenv("DEFAULT_PHOTOS_LIMIT", "60"))
 
 # Recovery code (anti-abuse)
 ALBUM_CODE_SALT = os.getenv("ALBUM_CODE_SALT", "")  # REQUIRED in Fly secrets for API
+
+# Redis / RQ (P3)
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+RQ_QUEUE_NAME = os.getenv("RQ_QUEUE_NAME", "findme").strip()
+
+
+def _enqueue_job(job_id: str) -> None:
+    """
+    Best-effort enqueue. If Redis is down/misconfigured,
+    we DO NOT break the API flow.
+    """
+    if not REDIS_URL or not job_id:
+        return
+    try:
+        r = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            health_check_interval=30,
+        )
+        # RQ stores queue list at: rq:queue:<name>
+        r.rpush(f"rq:queue:{RQ_QUEUE_NAME}", job_id)
+    except Exception:
+        # don't break user flow
+        return
 
 
 # -----------------------------
@@ -233,6 +260,11 @@ def version():
             "requiresSalt": True,
             "saltConfigured": bool(ALBUM_CODE_SALT),
         },
+        "queue": {
+            "enabled": bool(REDIS_URL),
+            "provider": "upstash_redis",
+            "queueName": RQ_QUEUE_NAME,
+        },
     }
 
 
@@ -396,6 +428,9 @@ def process_album(payload: ProcessRequest):
     if getattr(job_res, "error", None):
         raise HTTPException(status_code=500, detail="Job insert failed")
 
+    # enqueue (best-effort)
+    _enqueue_job(job_id)
+
     resp: Dict[str, Any] = {"albumId": album_id, "jobId": job_id}
     if recovery_code and not reused:
         resp["recoveryCode"] = recovery_code
@@ -453,8 +488,6 @@ def list_clusters(
     _require_album_access(sb, album_id, x_album_code, code)
 
     page_limit, page_offset = _parse_paging(limit, offset, DEFAULT_CLUSTERS_LIMIT)
-
-    # fetch limit+1 to compute hasMore without COUNT()
     fetch_n = page_limit + 1
 
     q = (
@@ -503,7 +536,6 @@ def list_photos_for_cluster(
     page_limit, page_offset = _parse_paging(limit, offset, DEFAULT_PHOTOS_LIMIT)
     fetch_n = page_limit + 1
 
-    # 1) page on photo_faces (cheapest)
     links_q = (
         sb.table("photo_faces")
         .select("photo_id")
@@ -534,7 +566,6 @@ def list_photos_for_cluster(
             },
         }
 
-    # 2) fetch photos for only this page
     photos_res = (
         sb.table("photos")
         .select("id,storage_path,created_at")
@@ -544,7 +575,6 @@ def list_photos_for_cluster(
     if getattr(photos_res, "error", None):
         raise HTTPException(status_code=500, detail="photos read failed")
 
-    # preserve ordering as in photo_faces page
     by_id: Dict[str, Dict[str, Any]] = {str(p.get("id")): p for p in (photos_res.data or []) if p.get("id")}
     ordered = []
     for pid in photo_ids:
