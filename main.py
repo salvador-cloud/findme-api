@@ -5,6 +5,7 @@ import requests
 import hashlib
 import secrets
 import string
+from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Optional, List, Dict, Any
 
@@ -356,7 +357,7 @@ def process_album(payload: ProcessRequest):
     if job_check.data:
         job_id = job_check.data[0]["id"]
         # IMPORTANT: never re-issue recoveryCode for reused albums
-        resp = {"albumId": album_id, "jobId": job_id}
+        resp: Dict[str, Any] = {"albumId": album_id, "jobId": job_id}
         if recovery_code and not reused:
             resp["recoveryCode"] = recovery_code
         return resp
@@ -378,7 +379,7 @@ def process_album(payload: ProcessRequest):
     if getattr(job_res, "error", None):
         raise HTTPException(status_code=500, detail="Job insert failed")
 
-    resp = {"albumId": album_id, "jobId": job_id}
+    resp: Dict[str, Any] = {"albumId": album_id, "jobId": job_id}
     if recovery_code and not reused:
         resp["recoveryCode"] = recovery_code
     return resp
