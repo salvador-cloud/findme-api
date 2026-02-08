@@ -5,7 +5,6 @@ import requests
 import hashlib
 import secrets
 import redis
-from rq import Queue
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Optional, List, Dict, Any, Tuple
@@ -16,7 +15,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-APP_VERSION = "v2026-02-08-p3-rq-redis-queue"
+APP_VERSION = "v2026-02-08-p3-redis-list-queue"
 
 app = FastAPI(title="findme-api", version=APP_VERSION)
 
@@ -38,44 +37,30 @@ DEFAULT_PHOTOS_LIMIT = int(os.getenv("DEFAULT_PHOTOS_LIMIT", "60"))
 # Recovery code (anti-abuse)
 ALBUM_CODE_SALT = os.getenv("ALBUM_CODE_SALT", "")  # REQUIRED in Fly secrets for API
 
-# Redis / RQ (P3)
+# Redis queue (P3 - ultra light)
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 RQ_QUEUE_NAME = os.getenv("RQ_QUEUE_NAME", "findme").strip()
 
 
 def _enqueue_job(job_id: str) -> None:
     """
-    Enqueue REAL en RQ.
-    - Crea rq:job:<id> (func + args + meta)
-    - Encola en rq:queue:<name>
-    Best-effort: si Redis está down/mal configurado, NO rompemos el flow del API.
+    Ultra-light enqueue:
+    - Push job_id string to Redis list: rq:queue:<name>
+    Best-effort: if Redis down/misconfigured, DO NOT break API flow.
     """
     if not REDIS_URL or not job_id:
         return
 
     try:
-        redis_conn = redis.Redis.from_url(
+        r = redis.Redis.from_url(
             REDIS_URL,
             decode_responses=True,
             socket_timeout=10,
             socket_connect_timeout=10,
             health_check_interval=30,
         )
-
-        q = Queue(name=RQ_QUEUE_NAME, connection=redis_conn)
-
-        # IMPORTANTE: el worker debe poder importar worker.process_job_id
-        q.enqueue_call(
-            func="worker.process_job_id",
-            args=(job_id,),
-            job_id=job_id,      # usamos mismo id para correlación + idempotencia
-            result_ttl=3600,
-            failure_ttl=86400,
-            ttl=86400,
-        )
-
+        r.rpush(f"rq:queue:{RQ_QUEUE_NAME}", job_id)
     except Exception:
-        # Best-effort: no romper UX
         return
 
 
@@ -277,8 +262,9 @@ def version():
         },
         "queue": {
             "enabled": bool(REDIS_URL),
-            "provider": "upstash_redis",
+            "provider": "redis_list",
             "queueName": RQ_QUEUE_NAME,
+            "redisKey": f"rq:queue:{RQ_QUEUE_NAME}",
         },
     }
 
