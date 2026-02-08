@@ -5,6 +5,7 @@ import requests
 import hashlib
 import secrets
 import redis
+from rq import Queue
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Optional, List, Dict, Any, Tuple
@@ -44,23 +45,37 @@ RQ_QUEUE_NAME = os.getenv("RQ_QUEUE_NAME", "findme").strip()
 
 def _enqueue_job(job_id: str) -> None:
     """
-    Best-effort enqueue. If Redis is down/misconfigured,
-    we DO NOT break the API flow.
+    Enqueue REAL en RQ.
+    - Crea rq:job:<id> (func + args + meta)
+    - Encola en rq:queue:<name>
+    Best-effort: si Redis está down/mal configurado, NO rompemos el flow del API.
     """
     if not REDIS_URL or not job_id:
         return
+
     try:
-        r = redis.Redis.from_url(
+        redis_conn = redis.Redis.from_url(
             REDIS_URL,
             decode_responses=True,
-            socket_timeout=5,
-            socket_connect_timeout=5,
+            socket_timeout=10,
+            socket_connect_timeout=10,
             health_check_interval=30,
         )
-        # RQ stores queue list at: rq:queue:<name>
-        r.rpush(f"rq:queue:{RQ_QUEUE_NAME}", job_id)
+
+        q = Queue(name=RQ_QUEUE_NAME, connection=redis_conn)
+
+        # IMPORTANTE: el worker debe poder importar worker.process_job_id
+        q.enqueue_call(
+            func="worker.process_job_id",
+            args=(job_id,),
+            job_id=job_id,      # usamos mismo id para correlación + idempotencia
+            result_ttl=3600,
+            failure_ttl=86400,
+            ttl=86400,
+        )
+
     except Exception:
-        # don't break user flow
+        # Best-effort: no romper UX
         return
 
 
